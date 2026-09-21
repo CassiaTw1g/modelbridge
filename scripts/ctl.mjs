@@ -219,19 +219,36 @@ async function waitForTunnelUrl(timeoutMs) {
 }
 
 /**
- * cloudflared's own view of this run: did it actually reach the edge, and how?
+ * cloudflared's own view of this run: is any edge connection alive *now*, and how?
  *
  * `Registered tunnel connection` means Cloudflare acknowledged a connection ID —
- * a real handshake, not just "a process exists". The failure that hid here for
- * ~20 hours produced nothing but `Unable to establish connection with Cloudflare
- * edge` lines, so "registered, and no such error since" is the honest summary.
+ * a real handshake, not just "a process exists". But a registration is a moment,
+ * not a state: cloudflared runs four connections and the tunnel works only while
+ * at least one of them is still up. So the question is what cloudflared logged
+ * LAST for each `connIndex`, up events and down events both counted.
+ *
+ * The two rules that came before were wrong in the same direction:
+ *   · "the process is alive" — hid a ~20-hour outage (2026-09-12).
+ *   · "a registration appears after the last `Unable to establish connection with
+ *     Cloudflare edge`" — that string is what a *blocked* edge produces. A tunnel
+ *     that registers and THEN loses its connections logs `Connection terminated`
+ *     / `Failed to dial` / `Retrying connection in` instead, none of which matched
+ *     that search, so `status` cheerfully reported 已连上边缘 straight through a
+ *     two-minute outage in which every request got 502 (2026-09-13, ~16:29Z).
+ *   Counting the down events is the whole fix; replaying both real outages
+ *   against this rule is what confirmed it.
  */
+const EDGE_EVENT =
+  /(Registered tunnel connection|Failed to dial|Retrying connection in|Lost connection with the edge|Connection terminated|Unregistered tunnel connection)[^\n]*?connIndex=(\d+)/g;
+const EDGE_UP = "Registered tunnel connection";
+
 function tunnelState() {
   const log = currentTunnelLog();
-  const lastReg = log.lastIndexOf("Registered tunnel connection");
-  const lastErr = log.lastIndexOf("Unable to establish connection with Cloudflare edge");
+  const last = new Map();
+  EDGE_EVENT.lastIndex = 0;
+  for (let m; (m = EDGE_EVENT.exec(log)); ) last.set(m[2], m[1]);
   return {
-    up: lastReg >= 0 && lastReg > lastErr,
+    up: [...last.values()].some((e) => e === EDGE_UP),
     proto: /Initial protocol (\w+)/.exec(log)?.[1] ?? null,
     url: findTunnelUrl(),
   };

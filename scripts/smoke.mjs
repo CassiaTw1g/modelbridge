@@ -104,10 +104,34 @@ const mask = (text) =>
 
 console.log(`目标: ${mask(ENDPOINT)}\n`);
 
-const health = await fetch(`${BASE}/health`)
-  .then((r) => r.json())
-  .catch(() => null);
-check("健康检查 /health 可达", health?.ok === true, JSON.stringify(health) ?? "无响应");
+/**
+ * The first request through a tunnel that has just come up, or that has been
+ * idle for a while, can fail while Cloudflare re-establishes the edge path —
+ * every request after it succeeds. Measured 2026-09-21: this check came back
+ * empty against a healthy tunnel, and six immediate requests to the same URL
+ * all returned `{"ok":true}`. One retry, so the self-check does not show a red
+ * FAIL that means nothing.
+ *
+ * This check runs first, so it is the request that absorbs the cold start; the
+ * five checks below it are unaffected either way.
+ */
+async function healthOnce() {
+  try {
+    const res = await fetch(`${BASE}/health`);
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+let health = await healthOnce();
+if (health?.ok !== true) {
+  await new Promise((r) => setTimeout(r, 1500));
+  health = await healthOnce();
+}
+// `JSON.stringify(null)` is the string "null", which is truthy — testing the
+// value rather than the string is what makes the 无响应 branch reachable.
+check("健康检查 /health 可达", health?.ok === true, health ? JSON.stringify(health) : "无响应");
 
 const bare = await fetch(`${BASE}/mcp`, { method: "POST", headers: HEADERS, body: "{}" });
 check("裸 /mcp 返回 404(端点未暴露)", bare.status === 404, `实际 ${bare.status}`);
