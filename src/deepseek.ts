@@ -2,8 +2,27 @@ import "dotenv/config";
 
 const BASE_URL = (process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com").replace(/\/+$/, "");
 const MODEL = process.env.DEEPSEEK_MODEL ?? "deepseek-flash";
-const TIMEOUT_MS = Number(process.env.DEEPSEEK_TIMEOUT_MS ?? 90_000);
-const MAX_OUTPUT_TOKENS = Number(process.env.DEEPSEEK_MAX_OUTPUT_TOKENS ?? 4096);
+const TIMEOUT_MS = Number(process.env.DEEPSEEK_TIMEOUT_MS ?? 180_000);
+
+/**
+ * `max_tokens` covers the reasoning **and** the answer on this model — they come
+ * out of the same budget. 4096 was small enough that a routine adversarial
+ * review spent all of it thinking and emitted an empty `content`, which reached
+ * the caller as "no answer" rather than as a truncation.
+ *
+ * Measured 2026-09-21 against `deepseek-flash`, same review prompt:
+ *
+ *   max_tokens=4096   → finish_reason "length", reasoning_tokens 4096, content ""
+ *   max_tokens=16384  → finish_reason "stop",   reasoning_tokens 4816, content 2617 chars
+ *
+ * The provider accepts far more (131072 probed without complaint), so the ceiling
+ * here is about latency, not about what the API allows: reasoning generates at
+ * roughly 165–210 tok/s, so the full 16384 budget is ~80–100 s of wall clock.
+ * `TIMEOUT_MS` has to sit above that or a long think is killed mid-flight and
+ * reported as a timeout instead of an answer. The caller's own tool-call window
+ * is the binding constraint beyond this point — see the README.
+ */
+const MAX_OUTPUT_TOKENS = Number(process.env.DEEPSEEK_MAX_OUTPUT_TOKENS ?? 16_384);
 
 export const MODES = ["analyze", "review", "code", "summarize"] as const;
 export type DeepSeekMode = (typeof MODES)[number];
@@ -32,6 +51,8 @@ export interface Usage {
   prompt_tokens?: number;
   completion_tokens?: number;
   total_tokens?: number;
+  /** On a reasoning model, the part of `completion_tokens` spent thinking. */
+  completion_tokens_details?: { reasoning_tokens?: number };
 }
 
 export interface ToolCall {
@@ -228,12 +249,34 @@ function toResult(turn: ModelTurn): DeepSeekResult {
 }
 
 /**
+ * What to say when reasoning ate the whole budget. The reasoning-token count is
+ * the number that separates "raise the ceiling" from "split the task", so it is
+ * reported rather than left for the operator to guess at.
+ */
+function truncatedByReasoning(turn: ModelTurn): string {
+  const used = turn.usage?.completion_tokens_details?.reasoning_tokens;
+  return (
+    `DeepSeek 的推理过程占满了 max_tokens(${MAX_OUTPUT_TOKENS}),正文一个字都没写。` +
+    (used === undefined ? "" : `本次推理用了 ${used} 个 token。`) +
+    `调高 DEEPSEEK_MAX_OUTPUT_TOKENS,或把任务拆小。`
+  );
+}
+
+/**
  * deepseek-flash returns `reasoning_content` alongside the answer, and sometimes
- * emits reasoning *only*: `content` comes back as an empty string, either
- * because reasoning consumed the whole max_tokens budget (finish_reason
- * "length") or because the model just stopped without writing anything
- * (finish_reason "stop" — measured at roughly 1 call in 10). Both would reach
- * Sol as a successful-looking but empty reply. It's transient, so one retry.
+ * emits reasoning *only*: `content` comes back as an empty string. There are two
+ * causes and they need opposite handling.
+ *
+ *  - `finish_reason: "stop"` — the model just stopped without writing anything.
+ *    Transient, measured at roughly 1 call in 10, so one retry earns its keep.
+ *  - `finish_reason: "length"` — reasoning consumed the entire `max_tokens`
+ *    budget. **Not** transient: the trigger is the request, so re-sending it
+ *    with the same budget truncates in the same place. Measured 2026-09-21 —
+ *    both attempts returned `content: ""`, `finish_reason: "length"`,
+ *    `reasoning_tokens: 4096`, exactly the budget. The old code retried anyway,
+ *    which spent a second paid call and another ~20 s of the caller's tool-call
+ *    window to arrive at the same empty answer and then explain it as "两次".
+ *    It now fails on the first one and says which number to change.
  */
 export async function callDeepSeek(req: DeepSeekRequest): Promise<DeepSeekResult> {
   const messages = buildMessages(req);
@@ -245,15 +288,15 @@ export async function callDeepSeek(req: DeepSeekRequest): Promise<DeepSeekResult
   // tool-call turn an empty `content` is the correct shape, not a transient
   // failure, and re-sending would duplicate the call.
   if (first.message.tool_calls?.length) return toResult(first);
+  if (first.finishReason === "length") throw new Error(truncatedByReasoning(first));
 
   const second = await chatCompletion({ messages });
   if (hasText(second)) return toResult(second);
+  if (second.finishReason === "length") throw new Error(truncatedByReasoning(second));
 
-  const reason =
-    second.finishReason === "length"
-      ? `推理过程占满了 max_tokens(${MAX_OUTPUT_TOKENS})`
-      : `模型只产出推理内容就结束了(finish_reason=${second.finishReason ?? "?"})`;
   throw new Error(
-    `DeepSeek 连续两次没有返回正文:${reason}。可调高 DEEPSEEK_MAX_OUTPUT_TOKENS,或把任务拆小。`,
+    `DeepSeek 连续两次没有返回正文:模型只产出推理内容就结束了` +
+      `(finish_reason=${second.finishReason ?? "?"})。这是偶发情况,重试一次通常就能过;` +
+      `连续两次都这样,说明任务本身太大或问得太散,把它拆小。`,
   );
 }

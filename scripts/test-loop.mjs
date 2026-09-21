@@ -158,6 +158,51 @@ test("两次都空则报错,且不会无限重试", async () => {
   }
 });
 
+// 推理顶满额度:实测 2026-09-21,同一条请求连续两次都是
+// finish_reason "length" / reasoning_tokens = 额度 / content ""。
+// 重发不会变好,只会再花一次钱和 20 秒调用窗口。
+const truncatedTurn = JSON.stringify({
+  model: "deepseek-flash",
+  choices: [
+    { finish_reason: "length", message: { role: "assistant", content: "", reasoning_content: "想了很久" } },
+  ],
+  usage: {
+    prompt_tokens: 10,
+    completion_tokens: 16_384,
+    total_tokens: 16_394,
+    completion_tokens_details: { reasoning_tokens: 12_000 },
+  },
+});
+
+test("推理顶满额度时不重试 —— 同一条请求必然同样被截断", async () => {
+  // 队列里第二个 textTurn 是诱饵:被消费掉就说明它重试了。
+  const { calls, restore } = stubFetch([truncatedTurn, textTurn]);
+  try {
+    const { callDeepSeek } = await import("../src/deepseek.ts");
+    await assert.rejects(
+      () => callDeepSeek({ task: "t", mode: "analyze" }),
+      /推理过程占满了 max_tokens\(\d+\)/,
+    );
+    assert.equal(calls.length, 1, `额度不够时重试了(${calls.length} 次)`);
+  } finally {
+    restore();
+  }
+});
+
+test("截断的报错里带上用掉的推理 token 数", async () => {
+  // 这个数字是"该调高额度"和"该拆任务"的分界线,不能被省成一句泛泛的失败。
+  const { restore } = stubFetch([truncatedTurn, textTurn]);
+  try {
+    const { callDeepSeek } = await import("../src/deepseek.ts");
+    await assert.rejects(
+      () => callDeepSeek({ task: "t", mode: "analyze" }),
+      /本次推理用了 12000 个 token/,
+    );
+  } finally {
+    restore();
+  }
+});
+
 test("工具定义随请求发出", async () => {
   const { calls, restore } = stubFetch([textTurn]);
   try {
