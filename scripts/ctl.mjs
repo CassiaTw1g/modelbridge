@@ -1282,10 +1282,16 @@ function cmdJobs(id, { trace = false } = {}) {
       console.error(`找不到任务 ${id}。`);
       process.exit(1);
     }
+    // Snapshots written before flash jobs existed have no `kind`. They were all
+    // agent jobs, so the fallback is the truth rather than a guess.
+    const flash = job.kind === "flash";
     console.log(`任务     : ${job.id}`);
     console.log(`状态     : ${job.state}`);
-    console.log(`工作区   : ${job.workspace}`);
-    console.log(`步数     : ${job.steps}`);
+    console.log(`类型     : ${flash ? "直连调用(deepseek_flash)" : "子代理(claude-code)"}`);
+    // Never print an empty line: a flash job has no workspace because it never
+    // touches the filesystem, and `${undefined}` would read as a missing field.
+    if (job.workspace) console.log(`工作区   : ${job.workspace}`);
+    console.log(flash ? `模型调用 : ${job.steps} 次` : `步数     : ${job.steps}`);
     console.log(`耗时     : ${formatDuration(job)}`);
     console.log(`验证码   : ${job.nonce}`);
     console.log(`任务内容 : ${mask(job.task)}`);
@@ -1310,7 +1316,10 @@ function cmdJobs(id, { trace = false } = {}) {
 
   console.log(`${jobs.length} 个任务(最近的在前):\n`);
   for (const job of jobs) {
-    console.log(`  ${job.id}  ${job.state.padEnd(17)} ${String(job.steps).padStart(3)} 步  ${formatDuration(job).padStart(8)}  ${job.nonce}`);
+    // A flash job has no steps to count — one model call is the whole job — so
+    // the column says what it is rather than printing a number it never reached.
+    const metric = job.kind === "flash" ? "  直连" : `${String(job.steps).padStart(3)} 步`;
+    console.log(`  ${job.id}  ${job.state.padEnd(17)} ${metric}  ${formatDuration(job).padStart(8)}  ${job.nonce}`);
     console.log(mask(`      ${shortTask(job.task)}`));
   }
   console.log("\n看某一个任务的完整轨迹:npm run ctl -- jobs <id> --trace");

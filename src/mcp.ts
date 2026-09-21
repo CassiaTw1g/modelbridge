@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { callDeepSeek, MODES } from "./deepseek.ts";
 import type { Job, Registry } from "./agent/jobs.ts";
+import { renderFlashText } from "./harness/flash.ts";
 import { admit, type SandboxPolicy } from "./sandbox.ts";
 
 /**
@@ -22,6 +23,16 @@ export const TOOL_DESCRIPTION = [
   "本工具无法访问文件系统,所有材料必须以文本形式通过 files 参数传入,**单次请求体上限 2MB**",
   "(材料必须由你原文粘贴进参数,所以要按这个上限裁剪)。DeepSeek 模型本身能读约 1M token,",
   "**但那是模型的能力,不是这条链路能传进去的量** —— 派发超长材料前请先拆分。",
+  "",
+  "## 返回有两种形态,注意区分",
+  "",
+  "DeepSeek 是推理模型,实测一次对抗性审查要 50 秒左右,而调用方的工具调用窗口通常只有 60 秒。",
+  "所以本工具的返回可能是:",
+  "",
+  "- **直接是答案** —— 正常情况,照常用。",
+  "- **一段带 job_id 的说明** —— 说明这次调用超过了同步等待窗口,**你还没有拿到答案**。",
+  "  此时立即调用 deepseek_agent_poll(传入那个 job_id)并重复,直到它返回 done 或 error。",
+  "  在拿到 done 之前,不要向用户报告任何结论,也不要自己代答这个问题。",
 ].join("\n");
 
 /**
@@ -58,21 +69,38 @@ const AGENT_START_DESCRIPTION = [
   "向用户报告时请附上 nonce 验证码。拿不到验证码,就说明你没有结果。",
 ].join("\n");
 
-const AGENT_POLL_DESCRIPTION = [
-  "查询或等待 deepseek_agent_start 返回的任务。",
+const POLL_DESCRIPTION = [
+  "查询或等待 deepseek_agent_start / deepseek_flash 返回的任务。",
   "",
   "wait_seconds 默认 20 秒,上限 40 秒。在这段时间内它会阻塞等待,任务一旦结束就立刻返回——所以**不要高频轮询**,一次等久一点。",
   "",
   "返回的 status:",
   '- "running":还没结束。继续调用本工具,不要向用户报告任何东西。',
   '- "waiting_approval":任务暂停,在等人批准一条命令。把提示原文转告用户,让他到电脑上处理。',
-  '- "done":结束了。此时才有 result 和 nonce,可以报告给用户。',
+  "- \"done\":结束了。此时才有结果和 nonce,可以报告给用户。",
   '- "error" / "cancelled":失败或被取消。把 error 原文转述给用户,不要自行修饰或淡化。',
   "  这类返回里可能还带一段「被中止前的半成品记录」。那是原始材料,不是结论:只能贴给用户看",
   "  并说明任务没跑完,或者用它把任务拆得更小再派一次。绝不能当成本次任务的结果报告。",
 ].join("\n");
 
-const SYNC_WINDOW_MS = 45_000;
+/**
+ * How long a tool call may block before it hands the caller a `job_id` instead
+ * of an answer.
+ *
+ * 45 s is chosen against the caller, not against us. ChatGPT abandons a tool
+ * call at around 60 s, so the response has to be on the wire well before that —
+ * and there has to be room for the poll that follows. Measured worst case for a
+ * single flash call is ~50 s, which is why the slow ones now go asynchronous
+ * rather than being reported to the user as a failure.
+ *
+ * Read per call rather than at import time: it is a knob about *the caller's*
+ * patience, and the offline tests need to shrink it to something that does not
+ * cost 45 seconds of wall clock to exercise.
+ */
+function syncWindowMs(): number {
+  const configured = Number(process.env.BRIDGE_SYNC_WINDOW_MS ?? "");
+  return Number.isFinite(configured) && configured > 0 ? configured : 45_000;
+}
 
 /**
  * `Promise.race` does not cancel the loser, so the sync-window timer keeps
@@ -126,9 +154,53 @@ function partialBlock(job: Job): string[] {
   ];
 }
 
+/**
+ * A finished flash job.
+ *
+ * Deliberately *not* the agent wording: there are no steps to report and no
+ * sub-agent that did the work. The answer is the entire payload, and the nonce
+ * is kept because the caller spent the wait being told it had nothing — so "I
+ * have the answer now" needs to be checkable rather than rhetorical.
+ */
+function flashDone(job: Job): string {
+  return [
+    `✅ 回答好了。验证码:${job.nonce}`,
+    "",
+    "DeepSeek 的回答:",
+    "────────────",
+    job.result?.text ?? "",
+    "────────────",
+    "",
+    `向用户报告时请附上验证码 ${job.nonce}。`,
+  ].join("\n");
+}
+
+/**
+ * Still running. The two kinds need different warnings: an agent job tempts the
+ * caller into describing progress it never received, a flash job tempts it into
+ * answering the question itself — which would quietly turn an independent
+ * cross-check into the caller's own opinion wearing DeepSeek's name.
+ */
+function runningPayload(job: Job): string {
+  const flash = job.kind === "flash";
+  return [
+    flash ? "⏳ DeepSeek 还在推理。**你目前还没有答案。**" : "⏳ 任务还在跑。**你目前没有任何结果。**",
+    "",
+    `job_id: ${job.id}`,
+    `已跑:${Math.round((Date.now() - job.startedAt) / 1000)} 秒`,
+    "",
+    `**下一步行动**:立即调用 deepseek_agent_poll,参数 job_id="${job.id}"。`,
+    "",
+    flash
+      ? '在拿到 status="done" 之前,不要向用户报告任何结论,也不要自己代答这个问题 —— 那就不是外部复核了。'
+      : '在它返回 status="done" 之前,不要向用户报告任何结论、进度或结果——你没有收到过。',
+  ].join("\n");
+}
+
 /** The payload doubles as the instruction — models weight the last result heavily. */
 function jobPayload(job: Job): string {
   if (job.state === "done") {
+    if (job.kind === "flash") return flashDone(job);
     return [
       `✅ 任务完成(${job.result?.steps ?? job.steps} 步)。验证码:${job.nonce}`,
       "",
@@ -167,23 +239,32 @@ function jobPayload(job: Job): string {
     ].join("\n");
   }
 
-  return [
-    "⏳ 任务还在跑。**你目前没有任何结果。**",
-    "",
-    `job_id: ${job.id}`,
-    `已跑:${Math.round((Date.now() - job.startedAt) / 1000)} 秒`,
-    "",
-    "**下一步行动**:立即调用 deepseek_agent_poll,参数 job_id=\"" + job.id + "\"。",
-    "",
-    '在它返回 status="done" 之前,不要向用户报告任何结论、进度或结果——你没有收到过。',
-  ].join("\n");
+  return runningPayload(job);
 }
 
 function errorText(text: string) {
   return { content: [{ type: "text" as const, text }], isError: true };
 }
 
-export function createMcpServer(registry?: Registry, policy?: SandboxPolicy): McpServer {
+export function createMcpServer(
+  registry?: Registry,
+  policy?: SandboxPolicy,
+  /**
+   * The registry that owns `deepseek_flash` calls.
+   *
+   * A second registry rather than a second kind of job in `registry`, because
+   * the two would otherwise share one concurrency ceiling: an agent job holds a
+   * slot for half an hour, and a flash job queued behind it would be refused
+   * with "同时运行的任务已达上限". They also have different runners — the agent
+   * registry's runner is the Claude Code harness, and pointing a flash call at
+   * it would spawn a sub-agent to answer a question.
+   *
+   * Optional: without it the tool keeps its original synchronous behaviour,
+   * which is what the offline tests and any embedding that has no job registry
+   * rely on.
+   */
+  flashRegistry?: Registry,
+): McpServer {
   // Must match package.json. It said 2.0.0 while the package said 1.0.0, so
   // every client was told a version this repository has never had.
   const server = new McpServer({ name: "modelbridge", version: "1.0.0" });
@@ -215,20 +296,64 @@ export function createMcpServer(registry?: Registry, policy?: SandboxPolicy): Mc
           ),
       },
     },
-    async ({ task, mode, files }) => {
+    async ({ task, mode, files }, extra) => {
+      const resolved = mode ?? "analyze";
+
+      const sync = async () => {
+        try {
+          return {
+            content: [
+              { type: "text" as const, text: renderFlashText(await callDeepSeek({ task, mode: resolved, files })) },
+            ],
+          };
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.error("deepseek_flash failed:", message);
+          return errorText(`DeepSeek 调用失败:${message}`);
+        }
+      };
+
+      if (!flashRegistry) return sync();
+
+      let job: Job;
       try {
-        const result = await callDeepSeek({ task, mode: mode ?? "analyze", files });
-        const { prompt_tokens, completion_tokens } = result.usage ?? {};
-        const footer =
-          prompt_tokens != null || completion_tokens != null
-            ? `\n\n[deepseek: ${result.model} | ${prompt_tokens ?? "?"} in / ${completion_tokens ?? "?"} out]`
-            : "";
-        return { content: [{ type: "text" as const, text: result.text + footer }] };
+        job = flashRegistry.start({ kind: "flash", task, mode: resolved, files });
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.error("deepseek_flash failed:", message);
-        return errorText(`DeepSeek 调用失败:${message}`);
+        // The concurrency ceiling. Nothing has been sent yet, so this is a plain
+        // refusal the caller can retry — not a failure to report as one.
+        return errorText(err instanceof Error ? err.message : String(err));
       }
+
+      console.log(
+        `[${new Date().toISOString()}] flash_job ${job.id} mode=${resolved} task=${task.slice(0, 80)}`,
+      );
+
+      // The job is already running and owns its own AbortController, so losing
+      // this race costs the caller nothing but the job_id — the answer is still
+      // on its way and `deepseek_agent_poll` can collect it. That is the whole
+      // point: the work no longer dies with the request that started it.
+      await Promise.race([
+        job.settled,
+        sleep(syncWindowMs()),
+        waitForAbort(extra?.signal as AbortSignal | undefined),
+      ]);
+
+      // Within the window the return shape is exactly what this tool has always
+      // returned. Only the slow path — the one that used to end in a timeout —
+      // changes, so a caller that ignores the job_id entirely still gets
+      // everything it used to get.
+      if (job.state === "done") {
+        return { content: [{ type: "text" as const, text: job.result?.text ?? "" }] };
+      }
+      if (job.state === "error" || job.state === "cancelled") {
+        const message = job.error ?? "(无错误信息)";
+        console.error("deepseek_flash failed:", message);
+        return errorText(
+          job.state === "cancelled" ? `DeepSeek 调用被取消:${message}` : `DeepSeek 调用失败:${message}`,
+        );
+      }
+
+      return { content: [{ type: "text" as const, text: jobPayload(job) }] };
     },
   );
 
@@ -284,21 +409,27 @@ export function createMcpServer(registry?: Registry, policy?: SandboxPolicy): Mc
         // either way, because a client hanging up is not a reason to stop work.
         await Promise.race([
           job.settled,
-          sleep(SYNC_WINDOW_MS),
+          sleep(syncWindowMs()),
           waitForAbort(extra?.signal as AbortSignal | undefined),
         ]);
 
         return { content: [{ type: "text" as const, text: jobPayload(job) }] };
       },
     );
+  }
 
+  // One poll tool for both kinds, deliberately. A second one would mean the
+  // caller has to pick the right one — and picking wrong is an error it cannot
+  // recover from except by guessing again, which is a worse failure than a
+  // slightly over-general name.
+  if (registry || flashRegistry) {
     server.registerTool(
       "deepseek_agent_poll",
       {
-        title: "DeepSeek 子代理:查询任务",
-        description: AGENT_POLL_DESCRIPTION,
+        title: "DeepSeek:查询任务",
+        description: POLL_DESCRIPTION,
         inputSchema: {
-          job_id: z.string().min(1).describe("deepseek_agent_start 返回的 job_id。"),
+          job_id: z.string().min(1).describe("deepseek_agent_start / deepseek_flash 返回的 job_id。"),
           wait_seconds: z
             .number()
             .int()
@@ -309,7 +440,9 @@ export function createMcpServer(registry?: Registry, policy?: SandboxPolicy): Mc
         },
       },
       async ({ job_id, wait_seconds }) => {
-        const job = registry.get(job_id);
+        // Two registries, one id space — every id is timestamp+random and each
+        // registry only holds what it started, so the first hit is the only hit.
+        const job = registry?.get(job_id) ?? flashRegistry?.get(job_id);
         if (!job) {
           return errorText(
             `找不到任务 ${job_id}。它可能已经超出保留时间被清理。用 \`npm run ctl -- jobs\` 查看本机上的任务记录。`,

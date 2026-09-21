@@ -279,6 +279,18 @@ export async function runClaudeCode(
   options: ClaudeCodeOptions = {},
 ): Promise<JobResult> {
   const workspace = input.workspace;
+  // Two different failures, and only one of them is the caller's doing.
+  //
+  // A missing workspace means the registry this runner is wired to was handed a
+  // job that is not an agent job — a flash job has no directory, because it
+  // never touches the filesystem. That is a wiring mistake, and the fix belongs
+  // at the wiring. It must certainly not be answered by falling back to
+  // `process.cwd()`: the workspace is the boundary the approval layer enforces,
+  // so inventing one would silently widen it to whatever directory the server
+  // happened to be started in.
+  if (!workspace) {
+    throw new Error("子代理任务缺少工作区:agent runner 收到了一个没有 workspace 的任务(接线错误)。");
+  }
   if (!existsSync(workspace) || !statSync(workspace).isDirectory()) {
     throw new Error(`工作区不存在或不是目录:${workspace}`);
   }

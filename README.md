@@ -65,10 +65,9 @@ The main practical payoff is **cross-vendor independent review**. If your prompt
 ```
 ChatGPT (Sol) ──HTTPS──▶ Cloudflare edge ──tunnel──▶ bridge (127.0.0.1:8787)
                                                             │
-   deepseek_flash(task, mode, files) ───────────────────────┤──▶ api.deepseek.com ──▶ text back
-                                                            │
-   deepseek_agent_start(task, workspace) ──▶ job registry ──┤   abort · TTL · nonce · step/time ceilings
-   deepseek_agent_poll(job_id) ◀────────────  snapshots     │
+   deepseek_flash(task, mode, files) ──▶ job registry ──────┤──▶ api.deepseek.com ──▶ text back,
+   deepseek_agent_start(task, workspace) ──▶ job registry ──┤   or a job id to poll
+   deepseek_agent_poll(job_id) ◀────────────  snapshots     │   abort · TTL · nonce · time ceilings
                                                             │
                                             harness: claude -p ──▶ api.deepseek.com/anthropic
                                                  │  Read / Write / Edit / Bash
@@ -90,7 +89,7 @@ Once a tool call reaches that approval prompt it is routed one of three ways, an
 - **Transport**: MCP Streamable HTTP, stateless (`sessionIdGenerator: undefined`, a fresh server + transport per request so callers never share state). The **job registry is deliberately not per-request** — it is created once per process, or every job would be forgotten the moment its `start` call returned.
 - **Responses stream as SSE** rather than buffered JSON. This keeps bytes moving on the wire, which avoids Cloudflare's free-tier **524** timeout on long DeepSeek calls.
 - **Auth**: a **capability URL**. The MCP endpoint is `/mcp/<64-hex-secret>`; the path *is* the credential. The bare `/mcp` path and any wrong path return **404**, indistinguishable from nothing being there — because ChatGPT's connector form has no Bearer-token field.
-- **Agent jobs are asynchronous by necessity.** ChatGPT's tool-call budget is around 60 s; a real task is not. `agent_start` blocks up to 45 s for a fast job and otherwise returns a job id to poll.
+- **Both tools are asynchronous by necessity.** ChatGPT's tool-call budget is around 60 s; a real task is not, and neither is a reasoning model. Measured: one adversarial review through `deepseek_flash` took **50 s**, and the same call through the full path has been seen at **63 s**. Each tool therefore blocks for up to 45 s and otherwise returns a job id to poll — see `BRIDGE_SYNC_WINDOW_MS` if your client's budget differs.
 
 ## Requirements
 
@@ -194,6 +193,10 @@ Three tools in two groups. All three are always registered — but until `DEEPSE
 
 Each `mode` gets a distinct system prompt. `review` explicitly instructs the model to treat any author conclusion in the material as an unverified claim and to state disagreements explicitly — that is the point of routing to an external vendor.
 
+Blocks up to **45 s**. A call that finishes inside that window returns its answer inline, unchanged; a slower one returns a **`job_id`** instead, and the answer is collected with `deepseek_agent_poll` like any other job. DeepSeek is a reasoning model — 50 s for one review is normal, not a fault — so this is the difference between "the answer is on its way" and "the caller gave up and reported a failure".
+
+A `job_id` means **there is no answer yet**. The payload says so, and the poll that follows is the only way to get one; a caller that reports a conclusion at that point has invented it.
+
 ### `deepseek_agent_start` — hand over a task that needs hands
 
 | Parameter | Type | Required | Description |
@@ -210,8 +213,10 @@ Blocks up to **45 s** (ChatGPT caps a tool call near 60 s). A fast job returns i
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `job_id` | string | yes | The id `deepseek_agent_start` returned. |
+| `job_id` | string | yes | The id `deepseek_agent_start` or `deepseek_flash` returned. |
 | `wait_seconds` | number | no | Blocking wait, default 20, max 40. Returns early if the job finishes sooner. |
+
+One poll tool serves both kinds on purpose. A second one would mean the caller has to guess which to use, and a wrong guess is an error it can only answer by guessing again.
 
 Every terminal payload carries a **nonce** minted at job creation. An agent that reports an outcome without quoting it does not have a result — that is the point.
 
@@ -235,10 +240,11 @@ All via `.env` (gitignored):
 | `TUNNEL_NAME` | — | Named mode, alternative to `TUNNEL_TOKEN`: the name of a tunnel you created with the `cloudflared` CLI. On that path cloudflared reads its own config and credentials, so the routing rule lives **there**, not in `TUNNEL_HOSTNAME` — keep the two in step. |
 | `TUNNEL_PROTOCOL` | *(probe)* | Transport cloudflared uses to reach the edge: `quic` (UDP 7844) or `http2` (TCP 7844). Leave unset and let it probe. Pin `quic` **behind a proxy or TUN-mode VPN** — TUN swallows outbound TCP/7844 while UDP passes straight through. The wrong choice fails quietly: the process stays alive and `ctl status` says "running" while nothing is reachable and the log repeats `TLS handshake with edge error: EOF`. Applies to both modes. |
 | `RATE_LIMIT_PER_MINUTE` | `60` | Sliding window that limits the blast radius if the URL leaks. **One global bucket, not per IP** — the server listens on loopback and the only client is the tunnel, so `X-Forwarded-For` is whatever the caller typed, and trusting it would make the limit read as "N/min per made-up IP". Only `tools/call` is counted: a single poll can cost three requests (initialize, tools/list, call), so counting handshakes would let a long job 429 itself with its own polling. |
+| `BRIDGE_SYNC_WINDOW_MS` | `45000` | How long `deepseek_flash` and `deepseek_agent_start` block before handing back a `job_id` instead of an answer. The default sits under ChatGPT's ~60 s tool-call budget; shorten it if your client's budget is tighter. Applies whether or not the agent tools are enabled. |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | OpenAI-compatible endpoint. |
 | `DEEPSEEK_MODEL` | `deepseek-flash` | Model ID. |
-| `DEEPSEEK_TIMEOUT_MS` | `90000` | Server-side timeout; returns a structured error instead of hanging. Kept under Cloudflare's 100 s edge timeout. |
-| `DEEPSEEK_MAX_OUTPUT_TOKENS` | `4096` | Output cap. `deepseek-flash` is a reasoning model: `reasoning_content` and `content` **share** this budget, so a task that over-reasons can starve the answer. |
+| `DEEPSEEK_TIMEOUT_MS` | `180000` | Timeout on one request to `api.deepseek.com`; returns a structured error instead of hanging. No longer held under Cloudflare's 100 s edge timeout: a call that outruns the sync window returns a `job_id`, so the response is not kept open for the whole model call. |
+| `DEEPSEEK_MAX_OUTPUT_TOKENS` | `16384` | Output cap. `deepseek-flash` is a reasoning model: `reasoning_content` and `content` **share** this budget, so a task that over-reasons can starve the answer. A code review over a real file needs the headroom — at `4096` the reasoning alone can consume the budget and leave `content` empty. |
 
 ### Agent jobs
 

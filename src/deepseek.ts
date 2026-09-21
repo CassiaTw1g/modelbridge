@@ -2,7 +2,12 @@ import "dotenv/config";
 
 const BASE_URL = (process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com").replace(/\/+$/, "");
 const MODEL = process.env.DEEPSEEK_MODEL ?? "deepseek-flash";
-const TIMEOUT_MS = Number(process.env.DEEPSEEK_TIMEOUT_MS ?? 180_000);
+/**
+ * Exported because the job registry needs it to place its own hard wall
+ * *behind* this deadline. When the wall fires first it reports the loss as a
+ * plain cancellation, which hides the real reason — see `createRegistry`.
+ */
+export const TIMEOUT_MS = Number(process.env.DEEPSEEK_TIMEOUT_MS ?? 180_000);
 
 /**
  * `max_tokens` covers the reasoning **and** the answer on this model — they come
@@ -104,6 +109,12 @@ export interface DeepSeekRequest {
   task: string;
   mode: DeepSeekMode;
   files?: string;
+  /**
+   * Cancellation, not a deadline: the request timeout is applied on top of it
+   * in `resolveSignal`. It exists so a job that has been killed stops costing
+   * money instead of running to completion with nobody listening.
+   */
+  signal?: AbortSignal;
 }
 
 interface WireChoice {
@@ -281,7 +292,7 @@ function truncatedByReasoning(turn: ModelTurn): string {
 export async function callDeepSeek(req: DeepSeekRequest): Promise<DeepSeekResult> {
   const messages = buildMessages(req);
 
-  const first = await chatCompletion({ messages });
+  const first = await chatCompletion({ messages, signal: req.signal });
   if (hasText(first)) return toResult(first);
 
   // The retry only makes sense when the model had nothing to call. On a
@@ -290,7 +301,11 @@ export async function callDeepSeek(req: DeepSeekRequest): Promise<DeepSeekResult
   if (first.message.tool_calls?.length) return toResult(first);
   if (first.finishReason === "length") throw new Error(truncatedByReasoning(first));
 
-  const second = await chatCompletion({ messages });
+  // A cancelled request must not be retried: the second call would be paid for
+  // and then thrown away when its signal — already aborted — fires.
+  if (req.signal?.aborted) throw new Error("DeepSeek 请求已被调用方取消。");
+
+  const second = await chatCompletion({ messages, signal: req.signal });
   if (hasText(second)) return toResult(second);
   if (second.finishReason === "length") throw new Error(truncatedByReasoning(second));
 

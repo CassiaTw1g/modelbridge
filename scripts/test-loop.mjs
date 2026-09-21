@@ -266,3 +266,110 @@ test("调用方取消与超时给出不同的错误 —— 取消不是超时", 
     globalThis.fetch = original;
   }
 });
+
+// --- 直连调用 runner --------------------------------------------------------
+//
+// deepseek_flash 现在也是一个任务(慢的那次交出 job_id)。runner 本身只有三件
+// 事要对:正文和用量一起交回来、把取消真的传到 fetch、以及不许自己吞掉错误。
+
+function fakeCtx(over = {}) {
+  const ac = new AbortController();
+  return {
+    jobId: "j-test",
+    signal: ac.signal,
+    events: [],
+    steps: 0,
+    record(e) {
+      this.events.push(e);
+    },
+    setSteps(n) {
+      this.steps = n;
+    },
+    setWaitingApproval() {},
+    checkCancelled: () => false,
+    ...over,
+  };
+}
+
+test("flash 正文的用量页脚只在真有用量时才加", async () => {
+  const { renderFlashText } = await import("../src/harness/flash.ts");
+  assert.equal(renderFlashText({ text: "答案", model: "deepseek-flash" }), "答案");
+  assert.equal(renderFlashText({ text: "答案", model: "deepseek-flash", usage: {} }), "答案");
+  assert.equal(
+    renderFlashText({
+      text: "答案",
+      model: "deepseek-flash",
+      usage: { prompt_tokens: 10, completion_tokens: 20 },
+    }),
+    "答案\n\n[deepseek: deepseek-flash | 10 in / 20 out]",
+  );
+});
+
+test("flash runner:正文连同用量一起交回来,并记下一次模型调用", async () => {
+  const { calls, restore } = stubFetch([textTurn]);
+  try {
+    const { flashRunner } = await import("../src/harness/flash.ts");
+    const ctx = fakeCtx();
+    const result = await flashRunner({ task: "t", mode: "analyze" }, ctx);
+
+    assert.equal(calls.length, 1);
+    assert.match(result.text, /^答案/);
+    assert.match(result.text, /\[deepseek: deepseek-flash \| 10 in \/ 5 out\]/, "用量页脚要和同步路径一字不差");
+    assert.equal(result.steps, 1);
+    assert.equal(ctx.steps, 1);
+  } finally {
+    restore();
+  }
+});
+
+test("flash runner:mode 真的进了系统提示词,不只是记在任务记录里", async () => {
+  const { calls, restore } = stubFetch([textTurn]);
+  try {
+    const { flashRunner } = await import("../src/harness/flash.ts");
+    await flashRunner({ task: "t", mode: "review" }, fakeCtx());
+    assert.match(calls[0].messages[0].content, /独立审查代理/, "record 里写 review 而实际用 analyze 的提示词,就是记录在撒谎");
+  } finally {
+    restore();
+  }
+});
+
+test("flash runner:kill 哨兵必须停掉请求,而不是等它自己跑完", async () => {
+  // 不等这一下会是三分钟的沉默:请求继续在跑、钱照花,结果回来时才被记成
+  // cancelled 扔掉 —— 而 `ctl jobs` 上完全看不出 kill 到底有没有生效。
+  const original = globalThis.fetch;
+  let aborted = false;
+  globalThis.fetch = async (_url, init) => {
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(resolve, 10_000);
+      init.signal?.addEventListener("abort", () => {
+        clearTimeout(t);
+        aborted = true;
+        const err = new Error("aborted");
+        err.name = "AbortError";
+        reject(err);
+      });
+    });
+    return new Response("{}", { status: 200 });
+  };
+  try {
+    const { flashRunner } = await import("../src/harness/flash.ts");
+    await assert.rejects(
+      () => flashRunner({ task: "t", mode: "analyze" }, fakeCtx({ checkCancelled: () => true })),
+      /已被调用方取消/,
+    );
+    assert.equal(aborted, true, "fetch 必须真的被中止,否则取消只是不再看结果");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("flash runner:失败原文原样抛出,不在这里被吞掉", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => new Response("bad key", { status: 401 });
+  try {
+    const { flashRunner } = await import("../src/harness/flash.ts");
+    await assert.rejects(() => flashRunner({ task: "t", mode: "analyze" }, fakeCtx()), /401/);
+  } finally {
+    globalThis.fetch = original;
+  }
+});

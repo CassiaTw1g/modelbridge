@@ -22,6 +22,23 @@ const CANCEL_DIR = join(STATE_DIR, "cancel");
 
 export type JobState = "running" | "waiting_approval" | "done" | "error" | "cancelled";
 
+/**
+ * What kind of work a job is.
+ *
+ * The registry used to hold one shape of job and one only — a Claude Code
+ * harness run, with a workspace, a step count and an approval queue — because
+ * that was the only thing it ran. `deepseek_flash` then needed the same
+ * machinery (id, nonce, state, salvage, TTL, a cross-process kill) for a
+ * different animal entirely: one chat completion. No workspace, no tools, no
+ * steps to count, nothing a human ever approves.
+ *
+ * Naming the difference is the point. The alternative was to file a flash call
+ * as an agent job with most of its fields blank, which is a record that lies
+ * about what ran — the exact failure this file already carries a comment about,
+ * from when every record named a harness that had not been chosen.
+ */
+export type JobKind = "agent" | "flash";
+
 export interface JobEvent {
   at: number;
   step: number;
@@ -47,9 +64,15 @@ export interface Job {
   /** Revealed only in the terminal result — see `nonce` in `start()`. */
   nonce: string;
   state: JobState;
+  kind: JobKind;
   task: string;
   mode: DeepSeekMode;
-  workspace: string;
+  /**
+   * Absent on a flash job: a single chat completion touches no files, so there
+   * is no directory it was allowed to work in and inventing one — the process
+   * cwd, say — would put a path in the record that nothing ever enforced.
+   */
+  workspace?: string;
   /** Which runner executed it. Supplied by the caller via `harnessName`. */
   harness: string;
   startedAt: number;
@@ -66,14 +89,27 @@ export interface Job {
 
 export interface JobInput {
   task: string;
+  /** Defaults to `"agent"` — the shape every existing caller meant. */
+  kind?: JobKind;
   /**
-   * Recorded, not honoured: the Claude Code harness picks its own behaviour
-   * from the task text. The `deepseek_agent_start` schema no longer offers it —
-   * a parameter that does nothing is worse than no parameter, because the
-   * caller plans around it. Kept here because it is part of the job record.
+   * On an agent job: recorded, not honoured — the Claude Code harness picks its
+   * own behaviour from the task text. The `deepseek_agent_start` schema no
+   * longer offers it, because a parameter that does nothing is worse than no
+   * parameter: the caller plans around it. Kept because it is part of the job
+   * record. On a flash job it *is* honoured: it selects the system prompt.
    */
   mode?: DeepSeekMode;
-  workspace: string;
+  workspace?: string;
+  /**
+   * Material for a flash job, passed through verbatim to the model.
+   *
+   * Deliberately **not** copied into the job record: it is capped at 2 MB and
+   * `snapshot()` writes the whole record to disk on every state change, so
+   * carrying it would mean rewriting megabytes of caller material to
+   * `.state/jobs` several times per call — and putting it in front of `ctl
+   * jobs`, which prints records.
+   */
+  files?: string;
 }
 
 export interface JobContext {
@@ -117,6 +153,14 @@ export interface Registry {
 }
 
 const MAX_EVENTS = 400;
+
+/**
+ * What `mode` means when the caller did not say. The two runners disagree on
+ * purpose: the harness overwrites the task text into its own prompt and this
+ * field only tags the record, whereas a flash job's `mode` *is* its system
+ * prompt — and "写出代码" is the wrong prompt for "帮我复核这段逻辑".
+ */
+const DEFAULT_MODE: Record<JobKind, DeepSeekMode> = { agent: "code", flash: "analyze" };
 
 /**
  * Short, pronounceable, unambiguous — no O/0 or I/1, so a model reciting it
@@ -235,12 +279,18 @@ export function createRegistry(run: JobRunner, opts: RegistryOptions = {}): Regi
 
       const { promise: settled, resolve: settle } = deferred();
 
+      const kind: JobKind = input.kind ?? "agent";
+
       const rec: JobRecord = {
         id: makeJobId(),
         nonce: makeNonce(),
         state: "running",
+        kind,
         task: input.task,
-        mode: input.mode ?? "code",
+        // The fallback follows the kind rather than being one constant. A flash
+        // job left to default to the agent default would run its `analyze`
+        // system prompt while its own record said `code`.
+        mode: input.mode ?? DEFAULT_MODE[kind],
         workspace: input.workspace,
         harness: harnessName,
         startedAt: Date.now(),

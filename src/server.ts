@@ -7,6 +7,7 @@ import { createMcpServer } from "./mcp.ts";
 import { STATE_DIR, createRegistry } from "./agent/jobs.ts";
 import { AUTO_APPROVE_FLAG, auditEvent } from "./agent/approvals.ts";
 import { createClaudeCodeRunner } from "./harness/claude-code.ts";
+import { FLASH_HARD_WALL_MS, FLASH_MAX_CONCURRENT, flashRunner } from "./harness/flash.ts";
 import { createPolicy, parseRoots } from "./sandbox.ts";
 
 const PORT = Number(process.env.PORT ?? 8787);
@@ -131,6 +132,22 @@ const registry = createRegistry(
   },
 );
 
+/**
+ * A second registry for `deepseek_flash`, and it has to be separate.
+ *
+ * Sharing one would share one concurrency ceiling: a sub-agent job occupies a
+ * slot for up to half an hour, so two running agents would leave a flash call —
+ * a single HTTP request that is finished in seconds — refused outright. The
+ * ceilings are as different as the work is, and so are the runners: this one
+ * holds the direct model call, whose only job is to survive longer than the
+ * caller's tool-call window without the work being lost.
+ */
+const flashRegistry = createRegistry(flashRunner, {
+  harnessName: "flash",
+  maxConcurrent: FLASH_MAX_CONCURRENT,
+  hardWallMs: FLASH_HARD_WALL_MS,
+});
+
 const app = express();
 // No `trust proxy`: this listener is bound to loopback and the only thing that
 // ever connects is the tunnel, so an X-Forwarded-For header carries no
@@ -163,7 +180,7 @@ app.post(MCP_PATH, async (req, res) => {
   // Stateless: a fresh server+transport per request. Sharing them across
   // requests leaks state between callers. The registry is passed in precisely
   // because it must NOT be per-request.
-  const server = createMcpServer(registry, policy);
+  const server = createMcpServer(registry, policy, flashRegistry);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 
   // Closing the transport aborts the SDK's per-request handler signal, which
@@ -223,8 +240,10 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     console.log(`Received ${signal}, shutting down.`);
     // Abort in-flight jobs first: each one owns a spawned Claude Code process
-    // and possibly a tree of grandchildren under it.
+    // and possibly a tree of grandchildren under it — and each flash job owns a
+    // paid request that nobody will be left to read.
     registry.shutdown();
+    flashRegistry.shutdown();
     httpServer.close(() => process.exit(0));
   });
 }

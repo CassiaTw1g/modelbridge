@@ -65,10 +65,9 @@ ChatGPT 的子代理槽位只接受 OpenAI 自家的模型档位(Sol / Terra / L
 ```
 ChatGPT (Sol) ──HTTPS──▶ Cloudflare 边缘 ──隧道──▶ 本桥接 (127.0.0.1:8787)
                                                           │
-   deepseek_flash(task, mode, files) ─────────────────────┤──▶ api.deepseek.com ──▶ 文本回来
-                                                          │
-   deepseek_agent_start(task, workspace) ──▶ 任务注册表 ───┤   abort · TTL · nonce · 步数/时长上限
-   deepseek_agent_poll(job_id) ◀─────────────  快照        │
+   deepseek_flash(task, mode, files) ──▶ 任务注册表 ───────┤──▶ api.deepseek.com ──▶ 文本回来,
+   deepseek_agent_start(task, workspace) ──▶ 任务注册表 ───┤   或者一个待轮询的 job id
+   deepseek_agent_poll(job_id) ◀─────────────  快照        │   abort · TTL · nonce · 步数/时长上限
                                                           │
                                           harness: claude -p ──▶ api.deepseek.com/anthropic
                                                │  Read / Write / Edit / Bash
@@ -90,7 +89,7 @@ ChatGPT (Sol) ──HTTPS──▶ Cloudflare 边缘 ──隧道──▶ 本�
 - **传输**:MCP Streamable HTTP,无状态(`sessionIdGenerator: undefined`,每个请求新建 server + transport,调用方之间不串数据)。但**任务注册表刻意不是每请求一个**——它整个进程只建一次,否则 `start` 一返回,任务就被忘光了。
 - **响应以 SSE 流式返回**,而不是缓冲成 JSON。这能让字节持续在链路上流动,避免 Cloudflare 免费版对长 DeepSeek 调用报 **524** 超时。
 - **鉴权**:能力 URL。MCP 端点是 `/mcp/<64 位 hex 密钥>`,**路径本身就是凭证**。裸 `/mcp` 和任何错误路径都返回 **404**,与"这里什么都没有"不可区分——因为 ChatGPT 的 connector 表单**没有填 Bearer token 的字段**。
-- **agent 任务必须异步**。ChatGPT 单次工具调用的预算约 60 秒,而一个真任务不止。`agent_start` 为快任务阻塞最多 45 秒,否则返回 job id 让你轮询。
+- **两个工具都必须异步**。ChatGPT 单次工具调用的预算约 60 秒,一个真任务不止,推理模型也不止。实测:一次对抗性审查走 `deepseek_flash` 用了 **50 秒**,同一条调用走完整路径见过 **63 秒**。所以两个工具都是阻塞最多 45 秒,超了就返回 job id 让你轮询——你的客户端预算不同就调 `BRIDGE_SYNC_WINDOW_MS`。
 
 ## 环境要求
 
@@ -194,6 +193,10 @@ npm run tunnel    # cloudflared 快速隧道；打印公网 URL 和完整的 MCP
 
 每个 `mode` 有独立的系统提示词。`review` 明确要求模型把材料中作者的结论视为**未经证实的声明**,并显式列出不同意之处——这正是把它路由到外部厂商的意义所在。
 
+阻塞最多 **45 秒**。在这个窗口内跑完的调用,答案照旧直接返回、形态一字不变;更慢的则返回一个 **`job_id`**,答案和别的任务一样用 `deepseek_agent_poll` 取回。DeepSeek 是推理模型——一次审查花 50 秒是正常的,不是故障——所以这件事的差别在于"答案正在路上"和"调用方放弃并报了失败"。
+
+拿到 `job_id` 意味着**此刻还没有答案**。返回的内容里写明了这一点,之后的轮询是拿到答案的唯一途径;此时就向用户报告结论的调用方,那个结论是它自己编的。
+
 ### `deepseek_agent_start` —— 派一个需要动手的任务
 
 | 参数 | 类型 | 必填 | 说明 |
@@ -210,8 +213,10 @@ npm run tunnel    # cloudflared 快速隧道；打印公网 URL 和完整的 MCP
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `job_id` | string | 是 | `deepseek_agent_start` 返回的 id。 |
+| `job_id` | string | 是 | `deepseek_agent_start` 或 `deepseek_flash` 返回的那个 id。 |
 | `wait_seconds` | number | 否 | 阻塞等待秒数,默认 20,上限 40。任务提前结束会立刻返回。 |
+
+一个轮询工具同时服务两类任务,这是有意的。拆成两个的话,调用方得先猜该用哪个,而猜错只会得到一个错误,它对此的唯一应对就是再猜一次。
 
 每个终态结果都带一个建任务时生成的 **nonce**。调用方报结果却报不出这个码,就等于它没有结果——这就是它存在的意义。
 
@@ -235,10 +240,11 @@ npm run tunnel    # cloudflared 快速隧道；打印公网 URL 和完整的 MCP
 | `TUNNEL_NAME` | — | named 模式,用来代替 `TUNNEL_TOKEN`:你用 `cloudflared` CLI 创建的隧道名。走这条路时 cloudflared 读它自己的配置和凭据,所以路由规则在**那份配置**里,不在 `TUNNEL_HOSTNAME`——两边要保持一致。 |
 | `TUNNEL_PROTOCOL` | *(自动探测)* | cloudflared 连边缘用的传输:`quic`(UDP 7844)或 `http2`(TCP 7844)。留空让它自己探测。**在代理或 TUN 模式梯子后面**请钉成 `quic`——TUN 会吞掉出站 TCP/7844,而 UDP 直通。选错是安静地失败:进程活着、`ctl status` 报"running",但外面够不着,日志反复刷 `TLS handshake with edge error: EOF`。两种隧道模式都适用。 |
 | `RATE_LIMIT_PER_MINUTE` | `60` | 滑动窗口,URL 泄漏时限制爆炸半径。**全局一个桶,不是每 IP 的**——服务监听在回环,连进来的只有隧道,所以 `X-Forwarded-For` 是调用方随手写的;信它等于把限流变成"每个假 IP N 次"。只计 `tools/call`:一次轮询可能算三次请求(initialize / tools/list / call),把握手算进去的话,长任务会被自己的轮询打成 429。 |
+| `BRIDGE_SYNC_WINDOW_MS` | `45000` | `deepseek_flash` 与 `deepseek_agent_start` 阻塞多久,超过就交回一个 `job_id` 而不是答案。默认值落在 ChatGPT 约 60 秒的工具调用预算之下;你的客户端预算更紧就调小。与 agent 工具是否开启无关,一直生效。 |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | OpenAI 兼容端点。 |
 | `DEEPSEEK_MODEL` | `deepseek-flash` | 模型 ID。 |
-| `DEEPSEEK_TIMEOUT_MS` | `90000` | 服务端超时;返回结构化错误而不是挂住。保持在 Cloudflare 100 秒边缘超时以下。 |
-| `DEEPSEEK_MAX_OUTPUT_TOKENS` | `4096` | 输出上限。`deepseek-flash` 是推理模型:`reasoning_content` 与 `content` **共享**这个预算,过度推理会挤掉正文。 |
+| `DEEPSEEK_TIMEOUT_MS` | `180000` | 单次请求 `api.deepseek.com` 的超时;返回结构化错误而不是挂住。不再压在 Cloudflare 100 秒边缘超时以下:超过同步窗口的调用会交回 `job_id`,响应不会被一整次模型调用撑住。 |
+| `DEEPSEEK_MAX_OUTPUT_TOKENS` | `16384` | 输出上限。`deepseek-flash` 是推理模型:`reasoning_content` 与 `content` **共享**这个预算,过度推理会挤掉正文。对真实文件做代码审查需要这份余量——`4096` 时光推理就能吃满预算,正文一个字都不剩。 |
 
 ### agent 任务
 
